@@ -1,0 +1,789 @@
+#include <xinu.h>
+#include <kernel.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+
+#if FS
+#include <fs.h>
+
+struct fsystem fsd;
+int dev0_numblocks;/* Inline function to c/* Inline function to convert inode number to block no*/
+#define INODE2BLOCKNO(inode_num) ((inode_num/8) + 2)
+
+/* Inline function to convert inode number to offset */
+#define INODE2OFFSET(inode_num)  ((inode_num%8) * sizeof(struct inode))onvert inode number to block no*/
+#define INODE2BLOCKNO(inode_num) ((inode_num/8) + 2)
+
+/* Inline function to convert inode number to offset */
+#define INODE2OFFSET(inode_num)  ((inode_num%8) * sizeof(struct inode))
+int dev0_blocksize;
+char *dev0_blocks;
+
+extern int dev0;
+
+char block_cache[512];
+
+#define SB_BLK 0
+#define BM_BLK 1
+#define RT_BLK 2
+
+#define NUM_FD 16
+struct filetable oft[NUM_FD];
+int next_open_fd = 0;
+
+
+#define INODES_PER_BLOCK (fsd.blocksz / sizeof(struct inode))
+#define NUM_INODE_BLOCKS (( (fsd.ninodes % INODES_PER_BLOCK) == 0) ? fsd.ninodes / INODES_PER_BLOCK : (fsd.ninodes / INODES_PER_BLOCK) + 1)
+#define FIRST_INODE_BLOCK 2
+
+#define DIRECTORY_SIZE 16
+#define FILETABLEN 100
+
+void fs_printfreemask(void);
+int fs_fileblock_to_diskblock(int dev, int fd, int fileblock);
+
+/* YOUR CODE GOES HERE */
+
+  int fs_fileblock_to_diskblock(int dev, int fd, int fileblock) {
+  int diskblock;
+
+  if (fileblock >= INODEBLOCKS - 2) {
+    printf("No indirect block support\n");
+    return SYSERR;
+  }
+
+  diskblock = oft[fd].in.blocks[fileblock]; //get the logical block address
+
+  return diskblock;
+}
+
+/* read in an inode and fill in the pointer */
+int
+fs_get_inode_by_num(int dev, int inode_number, struct inode *in) {
+  int bl, inn;
+  int inode_off;
+
+  if (dev != 0) {
+    printf("Unsupported device\n");
+    return SYSERR;
+  }
+  if (inode_number > fsd.ninodes) {
+    printf("fs_get_inode_by_num: inode %d out of range\n", inode_number);
+    return SYSERR;
+  }
+
+  bl = inode_number / INODES_PER_BLOCK;
+  inn = inode_number % INODES_PER_BLOCK;
+  bl += FIRST_INODE_BLOCK;
+
+  inode_off = inn * sizeof(struct inode);
+
+  /*
+  printf("in_no: %d = %d/%d\n", inode_number, bl, inn);
+  printf("inn*sizeof(struct inode): %d\n", inode_off);
+  */
+
+  bs_bread(dev0, bl, 0, &block_cache[0], fsd.blocksz);
+  memcpy(in, &block_cache[inode_off], sizeof(struct inode));
+
+  return OK;
+
+}
+
+int
+fs_put_inode_by_num(int dev, int inode_number, struct inode *in) {
+  int bl, inn;
+
+  if (dev != 0) {
+    printf("Unsupported device\n");
+    return SYSERR;
+  }
+  if (inode_number > fsd.ninodes) {
+    printf("fs_put_inode_by_num: inode %d out of range\n", inode_number);
+    return SYSERR;
+  }
+
+  bl = inode_number / INODES_PER_BLOCK;
+  inn = inode_number % INODES_PER_BLOCK;
+  bl += FIRST_INODE_BLOCK;
+
+  /*
+  printf("in_no: %d = %d/%d\n", inode_number, bl, inn);
+  */
+
+  bs_bread(dev0, bl, 0, block_cache, fsd.blocksz);
+  memcpy(&block_cache[(inn*sizeof(struct inode))], in, sizeof(struct inode));
+  bs_bwrite(dev0, bl, 0, block_cache, fsd.blocksz);
+
+  return OK;
+}
+     
+int fs_mkfs(int dev, int num_inodes) {
+  int i;
+  
+  if (dev == 0) {
+    fsd.nblocks = dev0_numblocks;
+    fsd.blocksz = dev0_blocksize;
+  }/* Inline function to convert inode number to block no*/
+#define INODE2BLOCKNO(inode_num) ((inode_num/8) + 2)
+
+/* Inline function to convert inode number to offset */
+#define INODE2OFFSET(inode_num)  ((inode_num%8) * sizeof(struct inode))
+  else {
+    printf("Unsupported device\n");
+    return SYSERR;
+  }
+
+  if (num_inodes < 1) {
+    fsd.ninodes = DEFAULT_NUM_INODES;
+  }
+  else {
+    fsd.ninodes = num_inodes;
+  }
+
+  i = fsd.nblocks;
+  while ( (i % 8) != 0) {i++;}
+  fsd.freemaskbytes = i / 8; 
+  
+  if ((fsd.freemask = getmem(fsd.freemaskbytes)) == (void *)SYSERR) {
+    printf("fs_mkfs memget failed.\n");
+    return SYSERR;
+  }
+  
+  /* zero the free mask */
+  for(i=0;i<fsd.freemaskbytes;i++) {
+    fsd.freemask[i] = '\0';
+  }
+  
+  fsd.inodes_used = 0;
+  
+  /* write the fsystem block to SB_BLK, mark block used */
+  fs_setmaskbit(SB_BLK);
+  bs_bwrite(dev0, SB_BLK, 0, &fsd, sizeof(struct fsystem));
+  
+  /* write the free block bitmask in BM_BLK, mark block used */
+  fs_setmaskbit(BM_BLK);
+  bs_bwrite(dev0, BM_BLK, 0, fsd.freemask, fsd.freemaskbytes);
+
+  return 1;
+}
+
+void
+fs_print_fsd(void) {
+
+  printf("fsd.ninodes: %d\n", fsd.ninodes);
+  printf("sizeof(struct inode): %d\n", sizeof(struct inode));
+  printf("INODES_PER_BLOCK: %d\n", INODES_PER_BLOCK);
+  printf("NUM_INODE_BLOCKS: %d\n", NUM_INODE_BLOCKS);
+}
+
+/* specify the block number to be set in the mask */
+int fs_setmaskbit(int b) {
+  int mbyte, mbit;
+  mbyte = b / 8;
+  mbit = b % 8;
+
+  fsd.freemask[mbyte] |= (0x80 >> mbit);
+  return OK;
+}
+
+/* specify the block number to be read in the mask */
+int fs_getmaskbit(int b) {
+  int mbyte, mbit;
+  mbyte = b / 8;
+  mbit = b % 8;
+
+  return( ( (fsd.freemask[mbyte] << mbit) & 0x80 ) >> 7);
+  return OK;
+
+}
+
+/* specify the block number to be unset in the mask */
+int fs_clearmaskbit(int b) {
+  int mbyte, mbit, invb;
+  mbyte = b / 8;
+  mbit = b % 8;
+
+  invb = ~(0x80 >> mbit);
+  invb &= 0xFF;
+
+  fsd.freemask[mbyte] &= invb;
+  return OK;
+}
+
+/* This is maybe a little overcomplicated since the lowest-numbered
+   block is indicated in the high-order bit.  Shift the byte by j
+   positions to make the match in bit7 (the 8th bit) and then shift
+   that value 7 times to the low-order bit to print.  Yes, it could be
+   the other way...  */
+void fs_printfreemask(void) {
+  int i,j;
+
+  for (i=0; i < fsd.freemaskbytes; i++) {
+    for (j=0; j < 8; j++) {
+      printf("%d", ((fsd.freemask[i] << j) & 0x80) >> 7);
+    }
+    if ( (i % 8) == 7) {
+      printf("\n");
+    }
+  }
+  printf("\n");
+}
+
+
+/**file operations**/
+int fclose(int fd)
+{
+    struct procent *prptr;	
+
+    int openftab_index = -1;
+    int cinode_index   = -1;
+    int i;
+    
+    if ((fd < 3) || (fd > NDESC))
+    {
+        printf("\n\rInvalid file descriptor.");
+        return EOF;
+    }
+
+    /* File descriptor to openfiletable index */
+    prptr = &proctab[currpid];
+    if (prptr->prdesc[fd] == UNUSED)
+    {
+        printf("\n\rFile descriptor %d not already in use.", fd);
+        return EOF;
+    }
+    else
+    {
+        openftab_index = prptr->prdesc[fd];
+        prptr->prdesc[fd] = UNUSED;
+    }
+    
+    /* openfiletable index to core inode */
+    if(openfiletable[openftab_index].state == UNUSED)
+    {
+        printf("\n\rOpen file table entry not found");
+        return EOF;
+    }else
+    {
+        openfiletable[openftab_index].state = UNUSED;
+        openfiletable[openftab_index].mode = -1;
+        openfiletable[openftab_index].fptr = 0;
+        cinode_index = openfiletable[openftab_index].in_core_inode_num;
+        openfiletable[openftab_index].in_core_inode_num = UNUSED;
+    }
+        
+    if(core_inode[cinode_index].id == UNUSED)
+    {
+        printf("\n\rCore Inode table entry not found");
+        return EOF;
+    }
+    else
+    {
+        core_inode[cinode_index].ref_count--;
+        if(0 == core_inode[cinode_index].ref_count)
+        {
+            /* Write core inode back to disk */
+            put_inode_by_num(0, cinode_index);
+        
+            /* Evacuate the Core inode for future use*/
+            core_inode[cinode_index].id         = UNUSED ;
+            core_inode[cinode_index].state      = UNLOCKED;
+            core_inode[cinode_index].ref_count  = 0;
+	    core_inode[cinode_index].type       = 0;
+            core_inode[cinode_index].nlink      = 0;
+            core_inode[cinode_index].device     = 0;
+            core_inode[cinode_index].size       = 0;
+        
+            for(i=0 ;i<FILEBLOCKS; i++){
+                core_inode[cinode_index].blocks[i] = UNUSED;
+	    }
+	}
+    }
+    return OK;
+}
+
+int fcreat(char *filename, int mode)
+{
+  int i;                                        //counter
+  int bm_blk = 0;                               //Directory block
+  int length;
+  int inode;
+  int incore_inode;
+  int filetablentry;
+  int dev_desc;
+  struct procent *prptr;
+   
+  if(mode != O_CREAT)
+  {
+    printf("\n\r Invalid Mode");
+    return -1;
+  }    
+  
+  //Check for max File descriptors for process 
+  prptr = &proctab[currpid];
+  for(i=3; i<NDESC; i++)
+  {
+    if(prptr->prdesc[i] == UNUSED)
+    {
+        break;
+    }
+  }
+  
+  if(i < NDESC)
+  {
+     dev_desc = i;
+  }
+  else
+  {
+    printf("\n\r Maximum open file descriptor limit reached");
+    return -1;
+  }
+  
+	//Check filename length
+	length = strnlen( filename, FILENAMELEN);
+	if (length > FILENAMELEN) 
+	{
+		return -1;
+	}
+	
+	//Read directory into memory
+  //if(bread(0, bm_blk, 0, &fsd, sizeof(struct fsystem)) == SYSERR)
+	//{
+	//  return -1;
+	//}
+	
+	//Check root directory for same filename
+	if(get_inode_by_name(filename) != SYSERR)
+	{
+	  printf("\n\r File alrady exist");
+	  return -1;
+  }
+	
+	
+  //Check number of used inode
+  if(fsd.inodes_used >= DIRECTORY_SIZE)                                     //HARDCODING
+  {
+    printf("All inode are in use \n\r");
+    return -1;
+  }	
+  
+  //Create file in directory
+  fsd.inodes_used = fsd.inodes_used + 1;
+  fsd.root_dir.numentries = fsd.root_dir.numentries + 1;
+  
+  //Find empty directory entry from predefined list.
+  for(i=0 ;i<DIRECTORY_SIZE; i++)
+	{
+	  if(fsd.root_dir.entry[i].inode_num == UNUSED )
+	  {
+	    break;
+	  }
+	}
+	
+	inode = i;
+	
+	//find free slot in incore list 
+  for(i=0 ;i<FILETABLEN; i++)
+	{
+	    if(core_inode[i].id == UNUSED){
+	       break;
+	    }
+	}
+	
+	if(i < FILETABLEN)
+	{
+    incore_inode = i;
+  }
+  else
+  {
+    printf("\n\r In core list is full");
+    return -1;
+  }
+  
+  core_inode[incore_inode].id         = inode ;
+  core_inode[incore_inode].state      = UNLOCKED;
+  core_inode[incore_inode].ref_count  = 1;
+  core_inode[incore_inode].type       = TYPE_FILE;
+  core_inode[incore_inode].nlink      = 1;
+  core_inode[incore_inode].device     = 0;
+  core_inode[incore_inode].size       = 0;
+  for(i=0 ;i<FILEBLOCKS; i++)
+	{
+    core_inode[incore_inode].blocks[i] = UNUSED;
+	}
+	
+	//store inode number
+	fsd.root_dir.entry[inode].inode_num = inode;
+	
+	//copy file name 
+	strncpy(fsd.root_dir.entry[inode].name,filename, length);
+	
+	//put inode in inode table 
+  put_inode_by_num( 0, incore_inode);
+  
+  //Write directory into memory
+  //if(bwrite(0, bm_blk, 0, &fsd, sizeof(struct fsystem)) == SYSERR)
+	//{
+	//  return -1;
+	//}
+    
+  //find free slot in open file table
+  for(i=0 ;i<FILETABLEN; i++)
+	{
+	    if(openfiletable[i].state == UNUSED){
+	       break;
+	    }
+	}
+	
+	if(i < FILETABLEN)
+	{
+    filetablentry = i;
+  }
+  else
+  {
+    printf("\n\r Open file table full");
+    return -1;
+  }
+  
+  //Update open file table for new file 
+  openfiletable[filetablentry].state = USED; 
+  openfiletable[filetablentry].mode = O_RDWR;
+  openfiletable[filetablentry].fptr = 0;
+  openfiletable[filetablentry].in_core_inode_num  = incore_inode;
+  
+  prptr->prdesc[dev_desc] = filetablentry;
+  return dev_desc;
+}
+
+int fopen(char *filename, int flags)
+{
+    int i;                                        //counter
+    int incore_inode_index;
+    int filetablentry;
+    int dev_desc;
+    struct procent *prptr;
+
+    switch(flags)
+    {
+    
+      case O_RDONLY: break;
+      
+      case O_WRONLY: break;
+      
+      case O_RDWR:   break;
+      
+      default:  printf("\n\r Invalid flag"); 
+                return -1;
+    }
+    
+    i = get_inode_by_name(filename);
+
+    if (i == SYSERR)
+    {
+        printf("\n\r%s: No such file or directory.", filename);
+        return -1;
+    }
+    else
+    {
+        incore_inode_index = i; 
+    }
+	  
+	  /*In core inode changes*/
+	  core_inode[incore_inode_index].state = UNLOCKED;
+    core_inode[incore_inode_index].ref_count ++;
+    
+    //find free slot in open file table
+    for (i=0; i < FILETABLEN; i++)
+	  {
+	    if (openfiletable[i].state == UNUSED)
+      {
+	        break;
+	    }
+	  }
+	
+	  if (i < FILETABLEN)
+	  {
+        filetablentry = i;
+    }
+    else
+    {
+        printf("\n\r Open-file table is full.");
+        return -1;
+    }
+  
+    //Update open file table for new file
+    openfiletable[filetablentry].state = USED; 
+    openfiletable[filetablentry].mode = flags;
+    openfiletable[filetablentry].fptr = 0;
+    openfiletable[filetablentry].in_core_inode_num   = incore_inode_index;
+  
+    /* truncate logic here */
+
+    //File descriptor 
+    prptr = &proctab[currpid];
+    for (i=3; i < NDESC; i++)
+    {
+        if(prptr->prdesc[i] == UNUSED)
+        {
+            break;
+        }
+    }
+  
+    if(i < NDESC)
+	  {
+        dev_desc = i;
+    }
+    else
+    {
+        printf("\n\r Maximum open file descriptor limit reached");
+        return -1;
+    }
+  
+    prptr->prdesc[dev_desc] = filetablentry;
+  
+    return dev_desc;
+}
+
+int fread(int fd, void *buf, int nbytes)
+{
+    struct procent *prptr;
+    int incore_inode_index;
+    int filetablentry;
+    int seek;
+    int data_block_no;
+    int data_block_offset;
+    int no_bytes_read;
+    int byes_to_read;
+    int block_no;
+    int start_poistion;
+    int remaining;
+    int i;
+    int size;
+    
+    if (nbytes == 0)
+    {
+      printf("\n\rInvalid number of bytes to read.");
+      return 0;
+    }
+    
+    if (buf == NULL)
+    {
+      printf("\n\rInvalid buffer pointer ");
+      return 0;
+    }
+    
+    prptr = &proctab[currpid];
+    if (prptr->prdesc[fd] == UNUSED)
+    {
+      printf("\n\rInvalid File Descriptor %d.", fd);
+      return 0;
+    }
+    
+    filetablentry = prptr->prdesc[fd];
+    if (openfiletable[filetablentry].state == UNUSED)
+    {
+      printf("\n\rOpen file table entry not found.");
+      return 0;
+    }
+    
+    seek = 0;
+    seek = openfiletable[filetablentry].fptr;
+    incore_inode_index = openfiletable[filetablentry].in_core_inode_num;
+    if(core_inode[incore_inode_index].id == UNUSED)
+    {
+        printf("\n\rCore Inode table entry not found");
+        return 0;
+    }
+    
+    size = core_inode[incore_inode_index].size;
+    
+    //logic to write partially filled block
+    data_block_no = seek / MDEV_BLOCK_SIZE;
+    data_block_offset = seek % MDEV_BLOCK_SIZE;
+    no_bytes_read = 0;
+    remaining  = ((seek + nbytes) > size) ? (size - seek) : nbytes;
+
+    while(remaining > 0)
+    {
+        byes_to_read = ( remaining < (MDEV_BLOCK_SIZE - data_block_offset))? remaining : (MDEV_BLOCK_SIZE - data_block_offset);
+        start_poistion  =  data_block_offset;
+        
+        block_no = block_no_from_datablock_no( incore_inode_index,  data_block_no);
+        if((block_no == UNUSED) || (block_no == SYSERR))
+        {
+            printf("\n\r Invalid data block");
+            return 0;  
+        }
+              
+        //printf("\n\rReading with parameters:%d, %d, %d", block_no, start_poistion, byes_to_read);  
+        if (block_offset_read( 0, block_no, start_poistion, buf+no_bytes_read, byes_to_read) == SYSERR)
+        {
+            printf("\n\r Error while reading data block");
+            return 0;
+        }
+        
+        no_bytes_read += byes_to_read;
+        remaining -= byes_to_read;
+        data_block_offset = 0;
+        data_block_no++; 
+    }
+    
+    openfiletable[filetablentry].fptr += no_bytes_read ;
+    return no_bytes_read;
+}
+
+
+int fseek(int fd, int offset)
+{
+    struct procent *prptr;
+    int incore_inode_index;
+    int filetablentry;
+    int seek;
+    int size;
+    
+    prptr = &proctab[currpid];
+    if (prptr->prdesc[fd] == UNUSED)
+    {
+      printf("\n\rInvalid File Descriptor %d.", fd);
+      return 0;
+    }
+    
+    filetablentry = prptr->prdesc[fd];
+    if (openfiletable[filetablentry].state == UNUSED)
+    {
+      printf("\n\rOpen file table entry not found.");
+      return 0;
+    }
+    
+    incore_inode_index = openfiletable[filetablentry].in_core_inode_num;
+    if(core_inode[incore_inode_index].id == UNUSED)
+    {
+        printf("\n\rCore Inode table entry not found");
+        return 0;
+    }
+    
+    size = core_inode[incore_inode_index].size;
+    seek = openfiletable[filetablentry].fptr;
+    
+    if (((seek+offset) >= 0) && ((seek+offset) <= size))
+    {
+        openfiletable[filetablentry].fptr = (seek+offset); 
+        return seek+offset;
+    }
+    else
+    {    
+        openfiletable[filetablentry].fptr =  seek;
+        return SYSERR;
+    }
+    
+    return SYSERR;
+}
+
+
+int fwrite(int fd, void *buf, int nbytes)
+{
+  struct procent *prptr;
+  int incore_inode_index;
+  int filetablentry;
+  int seek;
+  int data_block_no;
+  int data_block_offset;
+  int no_bytes_written;
+  int byes_to_write;
+  int block_no;
+  int start_poistion;
+  int remaining;
+  int i;
+
+  
+  if (nbytes == 0)
+  {
+      printf("\n\rInvalid number of bytes to write.");
+      return 0;
+  }
+  
+  if (buf == NULL)
+  {
+      printf("\n\rInvalid buffer pointer ");
+      return 0;
+  }
+  
+  prptr = &proctab[currpid];
+  if (prptr->prdesc[fd] == UNUSED)
+  {
+      printf("\n\rInvalid File Descriptor %d.", fd);
+      return 0;
+  }
+  
+  filetablentry = prptr->prdesc[fd];
+  if (openfiletable[filetablentry].state == UNUSED)
+  {
+      printf("\n\rOpen file table entry not found.");
+      return 0;
+  }
+  if (openfiletable[filetablentry].mode == O_RDONLY)
+  {
+      printf("\n\rFile not open for write/append.");
+      return 0;
+  }
+  
+  seek = openfiletable[filetablentry].fptr;
+  incore_inode_index = openfiletable[filetablentry].in_core_inode_num;
+  if(core_inode[incore_inode_index].id == UNUSED)
+  {
+      printf("\n\rCore Inode table entry not found");
+      return 0;
+  }
+  
+  //logic to write partially filled block
+  data_block_no = seek / MDEV_BLOCK_SIZE;
+  data_block_offset = seek % MDEV_BLOCK_SIZE;
+  no_bytes_written = 0;
+  remaining = nbytes;
+  
+  
+  while( no_bytes_written < nbytes )
+  {
+      byes_to_write = ( remaining < (MDEV_BLOCK_SIZE - data_block_offset))? remaining : (MDEV_BLOCK_SIZE - data_block_offset);
+      start_poistion  =  data_block_offset;
+      
+      block_no = block_no_from_datablock_no( incore_inode_index,  data_block_no);
+      
+      if(block_no == UNUSED)
+      {
+          block_no = allocate_block(incore_inode_index,  data_block_no);
+          //printf("\n\r Allocated block no is : %d",block_no);
+      }
+      
+      if(block_no == SYSERR)
+      {
+          printf("\n\r Invalid Data block number");
+          break;   
+      }
+      
+      //printf("\n\r Data Block no is : %d  and block no is : %d",data_block_no,block_no);
+      if (block_offset_write( 0, block_no, start_poistion, buf+no_bytes_written, byes_to_write) == SYSERR)
+      {
+          printf("\n\r Error while writing data block");
+          break;
+      }
+      
+      no_bytes_written += byes_to_write;
+      remaining -= byes_to_write;
+      data_block_offset = 0;
+      data_block_no++; 
+  }
+  
+   // update file size and seek pointer.
+    core_inode[incore_inode_index].size +=  no_bytes_written;
+      openfiletable[filetablentry].fptr += no_bytes_written ;
+  
+  return no_bytes_written;
+}
+
+/***************************************************************************************************************/
+
+#endif /* FS */

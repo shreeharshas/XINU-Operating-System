@@ -1,0 +1,70 @@
+#include <prodcons.h>
+
+// To Enqueue an integer
+void cEnqueue(pid32 idVal, struct CustQ *qObj) {
+    struct CustQ *temp;
+
+    if ((qObj->head == NULL) && (qObj->tail == NULL))
+    {
+        (qObj->qEntCount) = 0;
+
+        qObj->tail = getmem(sizeof(struct CustQ));
+        qObj->next = NULL;
+        qObj->val =idVal; 
+
+        head = tail;
+        (qObj->qEntCount) = 1;
+
+    }
+    else
+    {
+	temp = getmem(sizeof(struct CustQ));
+        qObj->tail->next = temp;
+        temp->val = idVal;
+        temp->next = NULL;
+        qObj->tail = tail->next;
+    }
+
+}
+
+
+// To Dequeue an integer.
+pid32 cDequeue(struct CustQ *qObj)) {
+
+	struct CustQ* temp = qObj->head;
+	pid32 retVal;
+
+	if(qObj->head == NULL) {
+		retVal = -1;
+
+	} else if(qObj->head == qObj->tail) {
+		qObj->head = qObj->tail = NULL;
+
+	} else {
+		qObj->head = qObj->head->next;
+	}
+	retVal = temp->val;
+	freemem(temp, sizeof(struct qObj));
+        (qObj.qEntCount)--;
+
+	return retVal;
+}
+
+
+void cQPrint(struct CustQ *qObj) {
+	struct Node* temp = qObj->head;
+	while(temp != NULL) {
+		printf("%d ",temp->val);
+		temp = temp->next;
+	}
+	printf("\n");
+}
+
+int cIsEmpty(struct CustQ *qObj) {
+	if ((qObj->head == NULL) && (qObj->tail == NULL))
+        return 1; // true
+    else
+       return 0; // false
+}
+
+

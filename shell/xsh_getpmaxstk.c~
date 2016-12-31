@@ -1,0 +1,47 @@
+/* xsh_getpmaxstk.c - xsh_getpmaxstk */
+
+#include <xinu.h>
+#include <string.h>
+#include <stdio.h>
+syscall	getavailablemem()
+	 
+{	
+	intmask mask; /* Saved interrupt mask */
+	struct memblk *prev, *curr, *leftover;
+	mask = disable();
+        int countlist=0;
+
+	prev = &memlist;
+	curr = memlist.mnext;
+	if(curr != NULL){
+		while (curr != NULL) { /* Search free list */
+        	        printf("Address:%d\tLength:%d\tNumberOfNodes:%d\n", curr, curr->mlength,++countlist);
+			curr = curr->mnext;
+			restore(mask);
+		}
+		restore(mask);
+		return OK;
+	}
+	restore(mask);
+	return (char *)SYSERR;
+}
+	
+/*------------------------------------------------------------------------
+ * xsh_getpmaxstk - get the maximum stack space of the current process
+ *------------------------------------------------------------------------
+ */
+shellcmd xsh_getmemforever(int nargs, char *args[]) {
+intmask mask;
+        struct TestMemory {
+    int *data;
+    char size;
+         };
+	mask = disable();
+        printf("Memory available before allocation");
+        getavailablemem();
+	struct TestMemory *retVal = getmemForEver(sizeof(struct TestMemory));
+        printf("Memory available after allocation");
+        getavailablemem();
+        restore(mask);
+	return 0;
+}

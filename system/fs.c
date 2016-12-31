@@ -1,0 +1,678 @@
+#include <xinu.h>
+#include <kernel.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <fs.h>
+
+#if FS
+
+struct fsystem fsd;
+int dev0_numblocks;
+int dev0_blocksize;
+char *dev0_blocks;
+
+extern int dev0;
+
+char block_cache[512];
+
+#define SB_BLK 0
+#define BM_BLK 1
+#define RT_BLK 2
+
+#define NUM_FD 16
+
+#define INODES_PER_BLOCK (fsd.blocksz / sizeof(struct inode))
+#define NUM_INODE_BLOCKS (( (fsd.ninodes % INODES_PER_BLOCK) == 0) ? fsd.ninodes / INODES_PER_BLOCK : (fsd.ninodes / INODES_PER_BLOCK) + 1)
+#define FIRST_INODE_BLOCK 2
+
+#define DIRECTORY_SIZE 16
+#define FILETABLEN 100
+
+struct filetable oft[NUM_FD];
+int next_open_fd = 0;
+struct fsystem fsd;
+struct filetable GlobalFileTab[INODEBLOCKS];
+struct inode current_inode[INODEBLOCKS];
+
+void fs_printfreemask(void);
+int fs_fileblock_to_diskblock(int dev, int fd, int fileblock);
+
+int fs_fileblock_to_diskblock(int dev, int fd, int fileblock) {
+  int diskblock;
+
+  if (fileblock >= INODEBLOCKS - 2) {
+    printf("No indirect block support\n");
+    return SYSERR;
+  }
+
+  diskblock = oft[fd].in.blocks[fileblock]; //get the logical block address
+
+  return diskblock;
+}
+
+
+int fs_block_no_from_num_d_blk(int c_inode_indx, int num_d_blk)
+{
+    int n_blk_1 = (MDEV_BLOCK_SIZE / sizeof(int));
+    int n_blk_2 = (MDEV_BLOCK_SIZE / sizeof(int)) * (MDEV_BLOCK_SIZE / sizeof(int));
+    int lvl_1_d_block;
+    int lvl_2_d_block;
+    int tmp_buf[n_blk_1];
+    
+    if (num_d_blk < 10)
+		{
+		    if(current_inode[c_inode_indx].blocks[num_d_blk] == F_INRW)
+			  {
+			      //printf("\n\r Data block is F_INRW");
+			      return F_INRW;
+			  }
+			  else
+			  {		
+			      return current_inode[c_inode_indx].blocks[num_d_blk];
+			  }
+		}
+		
+		// first level indirection pointers
+		else if (num_d_blk < (10 + n_blk_1)) 	
+		{
+			  if(current_inode[c_inode_indx].blocks[10] == F_INRW)
+			  {
+			      //printf("\n\r Data block is F_INRW");
+			      return F_INRW;
+			  }else
+			  {
+			      bs_bread(0, current_inode[c_inode_indx].blocks[10], 0, tmp_buf, MDEV_BLOCK_SIZE);
+			      if(tmp_buf[num_d_blk-10] == F_INRW)
+			      {
+			          return F_INRW;
+			      }
+			      else
+			      {
+			          return tmp_buf[num_d_blk-10];
+			      }
+			  }		
+		}
+		// second level indirection pointers
+		else if(num_d_blk < (10 + n_blk_1 + n_blk_2))
+		{
+		    if(current_inode[c_inode_indx].blocks[11] == F_INRW)
+			  {
+			      //printf("\n\r Data block is F_INRW 3");
+			      return F_INRW;
+			  }
+			  
+			  bs_bread(0, current_inode[c_inode_indx].blocks[11], 0, tmp_buf, MDEV_BLOCK_SIZE);
+			  
+			  // calculate first level datablock no. to read
+			  lvl_1_d_block = (num_d_blk - (10 + n_blk_1)) / n_blk_1 ;
+			  
+			  // check first level for F_INRW
+			  if(tmp_buf[lvl_1_d_block] == F_INRW)
+			  { 
+			      //printf("\n\r Data block is F_INRW 2");
+			      return F_INRW;
+			  }
+			  
+			  // read second level block
+			  bs_bread(0, tmp_buf[lvl_1_d_block], 0, tmp_buf, MDEV_BLOCK_SIZE);
+			   
+			  // calculate second level block number
+			  lvl_2_d_block = (num_d_blk - (10 + n_blk_1)) % n_blk_1;
+			  
+			  // check first level for F_INRW
+			  if(tmp_buf[lvl_2_d_block] == F_INRW)
+			  { 
+			      //printf("\n\r Data block is F_INRW 1");
+			      return F_INRW;
+			  }
+			  else
+			  {
+			        return tmp_buf[lvl_2_d_block];
+			  }
+			  
+		}
+		return SYSERR;
+}
+
+
+/* read in an inode and fill in the pointer */
+int fs_get_inode_by_num(int dev, int inode_number, struct inode *in) {
+  int bl, inn;
+  int inode_off;
+
+  if (dev != 0) {
+    printf("Unsupported device\n");
+    return SYSERR;
+  }
+  if (inode_number > fsd.ninodes) {
+    printf("fs_get_inode_by_num: inode %d out of range\n", inode_number);
+    return SYSERR;
+  }
+
+  bl = inode_number / INODES_PER_BLOCK;
+  inn = inode_number % INODES_PER_BLOCK;
+  bl += FIRST_INODE_BLOCK;
+
+  inode_off = inn * sizeof(struct inode);
+
+  /*
+  printf("in_no: %d = %d/%d\n", inode_number, bl, inn);
+  printf("inn*sizeof(struct inode): %d\n", inode_off);
+  */
+
+  bs_bread(dev0, bl, 0, &block_cache[0], fsd.blocksz);
+  memcpy(in, &block_cache[inode_off], sizeof(struct inode));
+
+  return OK;
+
+}
+
+int fs_put_inode_by_num(int dev, int inode_number, struct inode *in) {
+  int bl, inn;
+
+  if (dev != 0) {
+    printf("Unsupported device\n");
+    return SYSERR;
+  }
+  if (inode_number > fsd.ninodes) {
+    printf("fs_put_inode_by_num: inode %d out of range\n", inode_number);
+    return SYSERR;
+  }
+
+  bl = inode_number / INODES_PER_BLOCK;
+  inn = inode_number % INODES_PER_BLOCK;
+  bl += FIRST_INODE_BLOCK;
+
+  /*
+  printf("in_no: %d = %d/%d\n", inode_number, bl, inn);
+  */
+
+  bs_bread(dev0, bl, 0, block_cache, fsd.blocksz);
+  memcpy(&block_cache[(inn*sizeof(struct inode))], in, sizeof(struct inode));
+  bs_bwrite(dev0, bl, 0, block_cache, fsd.blocksz);
+
+  return OK;
+}
+     
+int fs_mkfs(int dev, int num_inodes) {
+  int i;
+  
+  if (dev == 0) {
+    fsd.nblocks = dev0_numblocks;
+    fsd.blocksz = dev0_blocksize;
+  }
+  else {
+    printf("Unsupported device\n");
+    return SYSERR;
+  }
+
+  if (num_inodes < 1) {
+    fsd.ninodes = DEFAULT_NUM_INODES;
+  }
+  else {
+    fsd.ninodes = num_inodes;
+  }
+
+  i = fsd.nblocks;
+  while ( (i % 8) != 0) {i++;}
+  fsd.freemaskbytes = i / 8; 
+  
+  if ((fsd.freemask = getmem(fsd.freemaskbytes)) == (void *)SYSERR) {
+    printf("fs_mkfs memget failed.\n");
+    return SYSERR;
+  }
+  
+  /* zero the free mask */
+  for(i=0;i<fsd.freemaskbytes;i++) {
+    fsd.freemask[i] = '\0';
+  }
+  
+  fsd.inodes_used = 0;
+  
+  /* write the fsystem block to SB_BLK, mark block F_NTRW */
+  fs_setmaskbit(SB_BLK);
+  bs_bwrite(dev0, SB_BLK, 0, &fsd, sizeof(struct fsystem));
+  
+  /* write the free block bitmask in BM_BLK, mark block F_NTRW */
+  fs_setmaskbit(BM_BLK);
+  bs_bwrite(dev0, BM_BLK, 0, fsd.freemask, fsd.freemaskbytes);
+
+  return 1;
+}
+
+void fs_print_fsd(void) {
+
+  printf("fsd.ninodes: %d\n", fsd.ninodes);
+  printf("sizeof(struct inode): %d\n", sizeof(struct inode));
+  printf("INODES_PER_BLOCK: %d\n", INODES_PER_BLOCK);
+  printf("NUM_INODE_BLOCKS: %d\n", NUM_INODE_BLOCKS);
+}
+
+/* specify the block number to be set in the mask */
+int fs_setmaskbit(int b) {
+  int mbyte, mbit;
+  mbyte = b / 8;
+  mbit = b % 8;
+
+  fsd.freemask[mbyte] |= (0x80 >> mbit);
+  return OK;
+}
+
+/* specify the block number to be read in the mask */
+int fs_getmaskbit(int b) {
+  int mbyte, mbit;
+  mbyte = b / 8;
+  mbit = b % 8;
+
+  return( ( (fsd.freemask[mbyte] << mbit) & 0x80 ) >> 7);
+  return OK;
+
+}
+
+/* specify the block number to be unset in the mask */
+int fs_clearmaskbit(int b) {
+  int mbyte, mbit, invb;
+  mbyte = b / 8;
+  mbit = b % 8;
+
+  invb = ~(0x80 >> mbit);
+  invb &= 0xFF;
+
+  fsd.freemask[mbyte] &= invb;
+  return OK;
+}
+
+/* This is maybe a little overcomplicated since the lowest-numbered
+   block is indicated in the high-order bit.  Shift the byte by j
+   positions to make the match in bit7 (the 8th bit) and then shift
+   that value 7 times to the low-order bit to print.  Yes, it could be
+   the other way...  */
+
+void fs_printfreemask(void) {
+  int i,j;
+
+  for (i=0; i < fsd.freemaskbytes; i++) {
+    for (j=0; j < 8; j++) {
+      printf("%d", ((fsd.freemask[i] << j) & 0x80) >> 7);
+    }
+    if ( (i % 8) == 7) {
+      printf("\n");
+    }
+  }
+  printf("\n");
+}
+
+
+/**file operations**/
+int fs_create(char *filename, int mode) {
+	int i;
+	int bm_blk = 0;
+	int length;
+	int inode;
+	int curr_node_num;
+	int filetablentry;
+	int dev_desc;
+	void *ptr = NULL;
+
+	struct procent *prptr;
+	if (mode == O_CREAT) {
+		prptr = &proctab[currpid];
+		dev_desc = i < NDESC ? i : dev_desc;
+			
+		if (i > NDESC) {
+			length = strnlen(filename, FILENAMELEN);
+			get_inode(filename);
+			fsd.inodes_used = fsd.inodes_used + 1;
+			fsd.root_dir.numentries = fsd.root_dir.numentries + 1;
+			inode = i;
+
+			if (i < FILETABLEN){
+				curr_node_num = i;
+			}
+			else{return -1;}
+
+			current_inode[curr_node_num].id = inode;
+			current_inode[curr_node_num].state = FSTATE_CLOSED;
+			current_inode[curr_node_num].type = TYPE_FILE;
+			current_inode[curr_node_num].nlink = 1;
+			current_inode[curr_node_num].device = 0;
+			current_inode[curr_node_num].size = 0;
+			for (i = 0;i < INODEBLOCKS; i++){
+				current_inode[curr_node_num].blocks[i] = F_INRW;
+			}
+
+			fsd.root_dir.entry[inode].inode_num = inode;
+			strncpy(fsd.root_dir.entry[inode].name, filename, length);
+			fs_put_inode_by_num(0, curr_node_num, ptr);
+			if (i < FILETABLEN) {
+				filetablentry = i;
+			}
+			else {return -1;}
+
+			GlobalFileTab[filetablentry].state = F_NTRW;
+			GlobalFileTab[filetablentry].mode = O_RDWR;
+			GlobalFileTab[filetablentry].fileptr = 0;
+			GlobalFileTab[filetablentry].curr_inode_num = curr_node_num;
+			prptr->prdesc[dev_desc] = filetablentry;
+			return dev_desc;
+		}
+		else {return -1;}
+	}
+	else { return -1; }
+	return dev_desc;
+}
+
+int fs_open(char *filename, int flags) {
+	int i;
+	int c_inode_indx;
+	int filetablentry;
+	int dev_desc;
+	struct procent *prptr;
+	
+	if (flags == O_RDONLY || flags == O_WRONLY || flags == O_RDWR) {
+		i = get_inode(filename);
+		if (i != SYSERR) {
+			c_inode_indx = i;
+			current_inode[c_inode_indx].state = FSTATE_CLOSED;
+			if (i < FILETABLEN) {
+				filetablentry = i;
+				GlobalFileTab[filetablentry].state = F_NTRW;
+				GlobalFileTab[filetablentry].mode = flags;
+				GlobalFileTab[filetablentry].fileptr = 0;
+				GlobalFileTab[filetablentry].curr_inode_num = c_inode_indx;
+
+				prptr = &proctab[currpid];
+				for (i = 3; i < NDESC; i++) {
+					if (prptr->prdesc[i] == F_INRW) {
+						break;
+					}
+				}
+
+				if (i < NDESC) { dev_desc = i; }
+				else { return -1; }
+				prptr->prdesc[dev_desc] = filetablentry;
+				return dev_desc;
+			}
+			else { return -1; }
+		}
+		else { return -1; }
+	}
+	else { return -1; }
+	return dev_desc;
+}
+
+int fs_close(int fd){
+	struct procent *prptr;
+	int openftab_index = -1;
+	int cinode_index = -1;
+	int i;
+	struct inode *ptr = NULL;
+
+	if ((fd < 3) || (fd > NDESC)) {return OK;}
+	prptr = &proctab[currpid];
+	if (prptr->prdesc[fd] != F_INRW) {
+		openftab_index = prptr->prdesc[fd];
+		prptr->prdesc[fd] = F_INRW;
+	}
+	else {return EOF;}
+
+	if (GlobalFileTab[openftab_index].state != F_INRW) {
+		GlobalFileTab[openftab_index].state = F_INRW;
+		GlobalFileTab[openftab_index].mode = -1;
+		GlobalFileTab[openftab_index].fileptr = 0;
+		cinode_index = GlobalFileTab[openftab_index].curr_inode_num;
+		GlobalFileTab[openftab_index].curr_inode_num = F_INRW;
+	}
+	else {return EOF;}
+
+	if (current_inode[cinode_index].id != F_INRW) {
+		ptr = &GlobalFileTab[cinode_index].in;
+		fs_put_inode_by_num(0, cinode_index, ptr);
+		current_inode[cinode_index].id = F_INRW;
+		current_inode[cinode_index].state = FSTATE_CLOSED;
+		current_inode[cinode_index].type = 0;
+		current_inode[cinode_index].nlink = 0;
+		current_inode[cinode_index].device = 0;
+		current_inode[cinode_index].size = 0;
+		for (i = 0;i<INODEBLOCKS; i++) {
+			current_inode[cinode_index].blocks[i] = F_INRW;
+		}
+	}
+	else{return EOF;}
+	return OK;
+}
+
+
+int fs_seek(int fd, int offset)
+{
+	struct procent *prptr;
+	int c_inode_indx;
+	int filetablentry;
+	int seek;
+	int size;
+
+	prptr = &proctab[currpid];
+	filetablentry = prptr->prdesc[fd];
+	if (GlobalFileTab[filetablentry].state != F_INRW) {
+		c_inode_indx = GlobalFileTab[filetablentry].curr_inode_num;
+		size = current_inode[c_inode_indx].size;
+		seek = GlobalFileTab[filetablentry].fileptr;
+		if (((seek + offset) >= 0) && ((seek + offset) <= size)) {
+			GlobalFileTab[filetablentry].fileptr = (seek + offset);
+			return seek + offset;
+		}
+		else {
+			GlobalFileTab[filetablentry].fileptr = seek;
+			return SYSERR;
+		}
+		return SYSERR;
+	}
+	else {return 0;}
+}
+
+int fs_read(int fd, void *buf, int nbytes)
+{
+	struct procent *prptr;
+	int curr_inode_in;
+	int ftab;
+	int seek;
+	int data_block_no;
+	int data_block_offset;
+	int n_done;
+	int n_to_read;
+	int block_no;
+	int spos;
+	int n_left;
+	int i;
+	int size;
+
+	if (nbytes != 0 && buf != NULL) {
+		prptr = &proctab[currpid];
+		ftab = prptr->prdesc[fd];
+		seek = 0;
+		seek = GlobalFileTab[ftab].fileptr;
+		curr_inode_in = GlobalFileTab[ftab].curr_inode_num;
+		size = current_inode[curr_inode_in].size;
+		data_block_no = seek / MDEV_BLOCK_SIZE;
+		data_block_offset = seek % MDEV_BLOCK_SIZE;
+		n_done = 0;
+		n_left = ((seek + nbytes) > size) ? (size - seek) : nbytes;
+
+		while (n_left > 0){
+			n_to_read = (n_left < (MDEV_BLOCK_SIZE - data_block_offset)) ? n_left : (MDEV_BLOCK_SIZE - data_block_offset);
+			spos = data_block_offset;
+			block_no = fs_block_no_from_num_d_blk(curr_inode_in, data_block_no);
+			if ((block_no != F_INRW) || (block_no != SYSERR)) {
+				if (bs_bread(0, block_no, spos, buf + n_done, n_to_read) == SYSERR){
+					return 0;
+				}
+			}
+			else{return 0;}
+			n_done += n_to_read;
+			n_left -= n_to_read;
+			data_block_offset = 0;
+			data_block_no++;
+		}
+		GlobalFileTab[ftab].fileptr += n_done;
+		return n_done;
+	}
+	else { return 0; }
+}
+
+int fs_write(int fd, void *buf, int nbytes)
+{
+	struct procent *prptr;
+	int c_inode_indx;
+	int filetablentry;
+	int seek;
+	int data_block_no;
+	int data_block_offset;
+	int n_done;
+	int n_to_write;
+	int block_no;
+	int spos;
+	int n_left;
+	int i;
+	int boffsetval;
+
+	if (nbytes != 0 && buf != NULL) {
+		prptr = &proctab[currpid];
+		filetablentry = prptr->prdesc[fd];
+		seek = GlobalFileTab[filetablentry].fileptr;
+		c_inode_indx = GlobalFileTab[filetablentry].curr_inode_num;
+		data_block_no = seek / MDEV_BLOCK_SIZE;
+		data_block_offset = seek % MDEV_BLOCK_SIZE;
+		n_done = 0;
+		n_left = nbytes;
+
+		while (n_done < nbytes) {
+			n_to_write = (n_left < (MDEV_BLOCK_SIZE - data_block_offset)) ? n_left : (MDEV_BLOCK_SIZE - data_block_offset);
+			spos = data_block_offset;
+			block_no = fs_block_no_from_num_d_blk(c_inode_indx, data_block_no);
+
+			if (block_no == F_INRW) {
+				block_no = get_block(c_inode_indx, data_block_no);
+			}
+
+			if (block_no != SYSERR) {
+				boffsetval = bs_bwrite(0, block_no, spos, buf + n_done, n_to_write);
+				if (boffsetval != SYSERR) {
+
+					n_done += n_to_write;
+					n_left -= n_to_write;
+					data_block_offset = 0;
+					data_block_no++;
+				}
+			}
+		}
+		current_inode[c_inode_indx].size += n_done;
+		GlobalFileTab[filetablentry].fileptr += n_done;
+		return n_done;
+	}
+	else {return 0;}
+}
+
+int get_inode(char *f_name){
+    int length;
+    int i;
+    struct inode *ptr = NULL;
+        for (i=0; i < DIRECTORY_SIZE; i++){
+            if ((fsd.root_dir.entry[i].inode_num != F_INRW) && (strncmp(f_name,fsd.root_dir.entry[i].name, FILENAMELEN) == 0)){
+	        ptr = &GlobalFileTab[i].in;
+                return fs_get_inode_by_num(0, i, ptr);    
+            }
+        }
+    return SYSERR;
+}
+
+int get_next_block(){
+  int i = 0;
+  while(fs_getmaskbit(i) == 1){
+   if(i<MDEV_NUM_BLOCKS){
+     i++;
+   }
+  }
+  fs_setmaskbit(i);
+  return i;
+}
+
+int get_block(int c_inode_indx, int num_d_blk){
+    int n_blk_1 = MDEV_BLOCK_SIZE / sizeof(int);
+    int n_blk_2 = (MDEV_BLOCK_SIZE / sizeof(int)) * (MDEV_BLOCK_SIZE / sizeof(int));
+    int lvl_1_d_block;
+    int lvl_2_d_block;
+    int tmp_buf[n_blk_1];
+    int tmp_buf2[n_blk_1];
+    int i, a_block;
+    int s_b_num = 10;
+
+    if (num_d_blk < s_b_num){
+	if(current_inode[c_inode_indx].blocks[num_d_blk] == F_INRW){
+	      return (current_inode[c_inode_indx].blocks[num_d_blk] = get_next_block());
+	  }
+    }
+
+    else if (num_d_blk < (s_b_num + n_blk_1)){
+	if(current_inode[c_inode_indx].blocks[s_b_num] == F_INRW){
+	   a_block = get_next_block();
+	   if (a_block == SYSERR){
+		return SYSERR;
+	   }
+
+	   current_inode[c_inode_indx].blocks[s_b_num] = a_block;
+	   for (i=0; i < n_blk_1; i++){
+	      	tmp_buf[i] = F_INRW;
+	   }
+	   bs_bwrite(0, current_inode[c_inode_indx].blocks[s_b_num], 0, tmp_buf, MDEV_BLOCK_SIZE);
+	}
+        bs_bread(0, current_inode[c_inode_indx].blocks[s_b_num], 0, tmp_buf, MDEV_BLOCK_SIZE);
+	a_block = get_next_block();
+	if (a_block == SYSERR){
+	   return SYSERR;
+        }
+    	tmp_buf[num_d_blk-s_b_num] = a_block;
+    	bs_bwrite(0, current_inode[c_inode_indx].blocks[s_b_num], 0, tmp_buf, MDEV_BLOCK_SIZE);
+        return (tmp_buf[num_d_blk-s_b_num]);
+    }
+
+    else if(num_d_blk < (s_b_num + n_blk_1 + n_blk_2)){
+    	if(current_inode[c_inode_indx].blocks[s_b_num+1] == F_INRW){
+		a_block = get_next_block();
+		if (a_block == SYSERR){
+		     return SYSERR;
+		}
+		current_inode[c_inode_indx].blocks[s_b_num+1] = a_block;
+                for (i=0; i < n_blk_1; i++){
+			tmp_buf[i] = F_INRW;
+		}
+		bs_bwrite(0, current_inode[c_inode_indx].blocks[s_b_num+1], 0, tmp_buf, MDEV_BLOCK_SIZE);
+	}
+			  
+	bs_bread(0, current_inode[c_inode_indx].blocks[s_b_num+1], 0, tmp_buf, MDEV_BLOCK_SIZE);
+	lvl_1_d_block = (num_d_blk - (s_b_num + n_blk_1)) / n_blk_1 ;
+	if(tmp_buf[lvl_1_d_block] == F_INRW){ 
+		a_block = get_next_block();
+		if (a_block == SYSERR){
+			return SYSERR;
+		}
+		tmp_buf[lvl_1_d_block] = a_block;
+		for (i=0; i < n_blk_1; i++){
+	   	        tmp_buf2[i] = F_INRW;
+		}
+        	bs_bwrite(0, current_inode[c_inode_indx].blocks[s_b_num+1], 0, tmp_buf, MDEV_BLOCK_SIZE);
+		bs_bwrite(0, tmp_buf[lvl_1_d_block], 0, tmp_buf2, MDEV_BLOCK_SIZE);
+        }
+	bs_bread(0, tmp_buf[lvl_1_d_block], 0, tmp_buf2, MDEV_BLOCK_SIZE);
+	lvl_2_d_block = (num_d_blk - (s_b_num + n_blk_1)) % n_blk_1;
+	a_block = get_next_block();
+	if (a_block == SYSERR){
+		return SYSERR;
+	}
+	tmp_buf2[lvl_2_d_block] = a_block;
+	bs_bwrite(0, tmp_buf[lvl_1_d_block], 0, tmp_buf2, MDEV_BLOCK_SIZE);
+	return tmp_buf2[lvl_2_d_block]; 
+	}
+   return SYSERR;
+}
+#endif /* FS */
